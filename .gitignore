@@ -1,1 +1,6 @@
 node_modules/ 
+<<<<<<< HEAD
+=======
+__pycache__/ 
+*.h5 
+>>>>>>> cb1bacf (İlk commit: proje dosyaları ve .gitignore eklendi)
