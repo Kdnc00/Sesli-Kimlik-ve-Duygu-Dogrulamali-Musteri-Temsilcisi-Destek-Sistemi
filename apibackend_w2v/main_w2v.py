@@ -147,6 +147,134 @@ def preprocess_for_wav2vec(features: np.ndarray) -> np.ndarray:
         features = features.reshape(1, -1)
     return features
 
+def predict_emotion_segmented(audio_path: str, segment_length: int = 5000):
+    """
+    Ses dosyasını belirtilen uzunluktaki segmentlere ayırır (varsayılan 5 saniye).
+    Her segmenti geçici bir dosya olarak kaydeder.
+    predict_emotion() fonksiyonunu kullanarak her segment için duygu tahmini yapar.
+    Sonuçları hem sırayla listeler hem de majority voting yöntemiyle genel duyguyu döndürür.
+    
+    Args:
+        audio_path (str): Ses dosyası yolu
+        segment_length (int): Segment uzunluğu (milisaniye, varsayılan 5000ms = 5sn)
+    
+    Returns:
+        tuple: (results, final_emotion)
+            - results: Her segmentin duygusu listesi
+            - final_emotion: Majority voting sonucu genel duygu
+    """
+    try:
+        # Ses dosyasını yükle
+        audio = AudioSegment.from_file(audio_path)
+        total_duration = len(audio)  # milisaniye
+        
+        # logger.info(f"🎵 Ses dosyası yüklendi: {total_duration}ms ({total_duration/1000:.1f}sn)")
+        
+        results = []
+        emotion_counts = {}
+        temp_files = []
+        
+        # Segmentlere ayır
+        for start_time in range(0, total_duration, segment_length):
+            end_time = min(start_time + segment_length, total_duration)
+            segment = audio[start_time:end_time]
+            
+            # Geçici dosya oluştur
+            temp_file = f"temp_segment_{start_time}_{uuid.uuid4().hex}.wav"
+            temp_path = os.path.join(BASE_DIR, temp_file)
+            temp_files.append(temp_path)
+            
+            # Segmenti kaydet
+            segment.export(temp_path, format="wav")
+            
+            # Duygu tahmini yap - doğrudan mevcut mantığı kullan
+            try:
+                # Convert to wav if needed
+                wav_path = convert_to_wav(temp_path)
+                if not wav_path:
+                    continue
+
+                # Extract features
+                features = extract_wav2vec_features(wav_path)
+                if features is None:
+                    continue
+
+                x = preprocess_for_wav2vec(features)
+                if x is None:
+                    continue
+
+                model = MODELS.get("Wav2Vec2")
+                if model is None:
+                    continue
+
+                prediction = model.predict(x, verbose=0)
+                pred_idx = int(np.argmax(prediction))
+                confidence = float(np.max(prediction))
+
+                if LABEL_ENCODER is not None and pred_idx < len(LABEL_ENCODER):
+                    predicted_emotion = LABEL_ENCODER[pred_idx]
+                    prediction_tr = EN_TO_TR.get(predicted_emotion, predicted_emotion)
+                else:
+                    continue
+                    
+                prediction_result = {
+                    "prediction": predicted_emotion, 
+                    "prediction_tr": prediction_tr,
+                    "confidence": confidence
+                }
+            except Exception as e:
+                logger.warning(f"Segment {start_time}-{end_time}ms için hata: {e}")
+                continue
+            
+            if "error" in prediction_result:
+                logger.warning(f"⚠️ Segment {start_time}-{end_time}ms için hata: {prediction_result['error']}")
+                continue
+            
+            # Sonucu kaydet
+            emotion_tr = prediction_result.get("prediction_tr", "Bilinmiyor")
+            confidence = prediction_result.get("confidence", 0.0)
+            
+            results.append({
+                "start_time": start_time,
+                "end_time": end_time,
+                "emotion": emotion_tr,
+                "confidence": confidence
+            })
+            
+            # Majority voting için say
+            if emotion_tr in emotion_counts:
+                emotion_counts[emotion_tr] += 1
+            else:
+                emotion_counts[emotion_tr] = 1
+            
+            # Sonucu yazdır (sadece gerekirse)
+            # start_sec = start_time / 1000
+            # end_sec = end_time / 1000
+            # print(f"{start_sec:.0f}-{end_sec:.0f} sn: {emotion_tr} (güven: {confidence:.2f})")
+        
+        # Majority voting ile final duygu
+        if emotion_counts:
+            final_emotion = max(emotion_counts, key=emotion_counts.get)
+        else:
+            final_emotion = "Bilinmiyor"
+        
+        # logger.info(f"📊 Segment analizi tamamlandı. Final duygu: {final_emotion}")
+        # logger.info(f"📈 Duygu dağılımı: {emotion_counts}")
+        
+        return results, final_emotion
+        
+    except Exception as e:
+        logger.error(f"❌ Segment analizi hatası: {e}")
+        return [], "Hata"
+    finally:
+        # Geçici dosyaları temizle
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+
 # ==========================
 # Endpoints
 # ==========================
@@ -192,9 +320,6 @@ async def predict(file: UploadFile = File(...)):
         prediction = model.predict(x, verbose=0)
         pred_idx = int(np.argmax(prediction))
         confidence = float(np.max(prediction))
-
-        logger.info(f"🔍 Raw prediction vector: {prediction}")
-        logger.info(f"✅ Predicted idx: {pred_idx}, confidence: {confidence}")
 
         if LABEL_ENCODER is not None and pred_idx < len(LABEL_ENCODER):
             predicted_emotion = LABEL_ENCODER[pred_idx]
